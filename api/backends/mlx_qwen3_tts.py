@@ -149,27 +149,46 @@ class MLXQwen3TTSBackend(TTSBackend):
                     'pip install -e ".[api,mlx]"'
                 ) from exc
 
-            # Monkey-patch AutoTokenizer to fix the Mistral regex bug.
-            # Qwen3-TTS MLX checkpoint's tokenizer_config has an
-            # incorrect regex pattern; upstream mlx-audio doesn't pass
-            # fix_mistral_regex=True yet.  This patch intercepts the
-            # call inside post_load_hook so the tokenizer loads
-            # correctly.
-            import transformers
-            _orig_from_pretrained = transformers.AutoTokenizer.from_pretrained
+            # transformers 5.0.0rc3 logs a one-time "incorrect regex
+            # pattern ... set fix_mistral_regex=True" advisory when the
+            # Qwen3-TTS text tokenizer is loaded (lazily, inside the
+            # model's post_load_hook on the first generate() call).
+            #
+            # We deliberately do NOT set that flag:
+            #  * It is a false positive here -- the checkpoint ships a
+            #    Qwen2 tokenizer, not a Mistral one. transformers trips
+            #    the warning via a coarse vocab-size heuristic on the
+            #    local-load path, not because this is a Mistral model.
+            #  * It is un-settable in this transformers version anyway:
+            #    AutoTokenizer.from_pretrained(..., fix_mistral_regex=True)
+            #    raises "TokenizersBackend._patch_mistral_regex() got
+            #    multiple values for keyword argument 'fix_mistral_regex'"
+            #    (upstream forwards the kwarg both explicitly and via
+            #    **kwargs at tokenization_utils_tokenizers.py:373-379),
+            #    which breaks tokenizer load entirely and 500s the
+            #    /v1/audio/speech route.
+            #
+            # So we silence just that one advisory log line. The filter
+            # is installed once and left in place, because the tokenizer
+            # is loaded later -- during the first generate() call, not
+            # during load_model() below.
+            import logging as _logging
 
-            def _patched_from_pretrained(*args: Any, **kwargs: Any) -> Any:
-                return _orig_from_pretrained(
-                    *args, fix_mistral_regex=True, **kwargs
-                )
+            class _DropMistralRegexWarning(_logging.Filter):
+                def filter(self, record: _logging.LogRecord) -> bool:
+                    return "fix_mistral_regex" not in record.getMessage()
 
-            transformers.AutoTokenizer.from_pretrained = _patched_from_pretrained  # type: ignore[assignment]
+            _tok_logger = _logging.getLogger(
+                "transformers.tokenization_utils_tokenizers"
+            )
+            if not any(
+                isinstance(f, _DropMistralRegexWarning)
+                for f in _tok_logger.filters
+            ):
+                _tok_logger.addFilter(_DropMistralRegexWarning())
 
-            try:
-                logger.info("Loading MLX model: %s", self.model_name)
-                model = load_model(self.model_name)
-            finally:
-                transformers.AutoTokenizer.from_pretrained = _orig_from_pretrained  # type: ignore[assignment]
+            logger.info("Loading MLX model: %s", self.model_name)
+            model = load_model(self.model_name)
 
             speaker_getter = getattr(model, "get_supported_speakers", None)
             language_getter = getattr(model, "get_supported_languages", None)
