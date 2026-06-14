@@ -44,85 +44,95 @@ except ValueError:
 _generation_semaphore = asyncio.Semaphore(_MAX_CONCURRENT)
 
 # --- Auto-chunking -----------------------------------------------------------
-# Long inputs are split on sentence punctuation (. ! ?) into chunks, each
-# synthesized separately and the audio concatenated back together. This keeps
-# every generation well under the backend's wall-clock cap (and below the
-# mlx-audio 0.3.x graph-compile hang threshold for long sequences), and lowers
-# memory pressure. Short inputs (a single chunk) take the original code path
-# with zero overhead.
-#   TTS_AUTOCHUNK=false       disable entirely
-#   TTS_MAX_CHUNK_CHARS=240   target max characters per chunk
-#   TTS_CHUNK_GAP_MS=120      silence inserted between merged chunks
+# Input is split at punctuation into chunks sized to a [min, max] character
+# window, each synthesized separately and the audio concatenated back together.
+# This keeps every generation well under the backend's wall-clock cap (and below
+# the mlx-audio 0.3.x graph-compile hang threshold for long sequences), and
+# lowers first-audio latency. Inputs that fit in a single chunk take the
+# original code path with zero overhead.
+#
+# Splitting prefers sentence punctuation (. ! ?), then clause punctuation
+# (, ; :), then word boundaries. Chunks are packed greedily up to max_chars and
+# kept at/above min_chars where possible (a too-small piece is merged with a
+# neighbour as long as the result still fits within max_chars).
+#   TTS_AUTOCHUNK=false        disable entirely
+#   TTS_MIN_CHUNK_CHARS=20     soft lower bound per chunk
+#   TTS_MAX_CHUNK_CHARS=70     hard upper bound per chunk
+#   TTS_CHUNK_GAP_MS=120       silence inserted between merged chunks
 try:
     _AUTOCHUNK = os.getenv("TTS_AUTOCHUNK", "true").lower() == "true"
-    _MAX_CHUNK_CHARS = max(1, int(os.getenv("TTS_MAX_CHUNK_CHARS", "240")))
+    _MIN_CHUNK_CHARS = max(1, int(os.getenv("TTS_MIN_CHUNK_CHARS", "20")))
+    _MAX_CHUNK_CHARS = max(_MIN_CHUNK_CHARS, int(os.getenv("TTS_MAX_CHUNK_CHARS", "70")))
     _CHUNK_GAP_MS = max(0, int(os.getenv("TTS_CHUNK_GAP_MS", "120")))
 except ValueError:
     logger.warning("Invalid auto-chunk env value; using defaults")
-    _AUTOCHUNK, _MAX_CHUNK_CHARS, _CHUNK_GAP_MS = True, 240, 120
+    _AUTOCHUNK, _MIN_CHUNK_CHARS, _MAX_CHUNK_CHARS, _CHUNK_GAP_MS = True, 20, 70, 120
 
 
-def _hard_split(segment: str, max_chars: int) -> List[str]:
-    """Split a single over-long run (no sentence breaks) on commas, then
-    on whitespace as a last resort, so no chunk exceeds max_chars."""
-    pieces, buf = [], ""
-    # Prefer comma / semicolon / colon boundaries (keep the delimiter).
-    for part in re.split(r"(?<=[,;:])\s+", segment.strip()):
-        part = part.strip()
-        if not part:
-            continue
-        if not buf:
-            buf = part
-        elif len(buf) + 1 + len(part) <= max_chars:
-            buf += " " + part
-        else:
-            pieces.append(buf)
-            buf = part
-    if buf:
-        pieces.append(buf)
-    # Anything still too long: split on word boundaries.
+def _pieces(text: str, max_chars: int) -> List[str]:
+    """Break text into pieces each <= max_chars, splitting on sentence
+    punctuation (. ! ?), then clause punctuation (, ; :), then words."""
     out: List[str] = []
-    for p in pieces:
-        if len(p) <= max_chars:
-            out.append(p)
+    for sent in re.split(r"(?<=[.!?])\s+", text.strip()):
+        sent = sent.strip()
+        if not sent:
             continue
-        words, b = p.split(), ""
-        for w in words:
-            if not b:
-                b = w
-            elif len(b) + 1 + len(w) <= max_chars:
-                b += " " + w
-            else:
-                out.append(b)
-                b = w
-        if b:
-            out.append(b)
+        if len(sent) <= max_chars:
+            out.append(sent)
+            continue
+        for clause in re.split(r"(?<=[,;:])\s+", sent):
+            clause = clause.strip()
+            if not clause:
+                continue
+            if len(clause) <= max_chars:
+                out.append(clause)
+                continue
+            buf = ""
+            for w in clause.split():
+                if not buf:
+                    buf = w
+                elif len(buf) + 1 + len(w) <= max_chars:
+                    buf += " " + w
+                else:
+                    out.append(buf)
+                    buf = w
+            if buf:
+                out.append(buf)
     return out
 
 
-def _split_into_chunks(text: str, max_chars: int) -> List[str]:
-    """Split text into chunks on sentence punctuation (. ! ?), merging
-    consecutive sentences up to max_chars. Over-long sentences are hard-split."""
-    sentences = re.split(r"(?<=[.!?])\s+", text.strip())
+def _split_into_chunks(text: str, min_chars: int, max_chars: int) -> List[str]:
+    """Split text into chunks within a [min_chars, max_chars] window, breaking
+    at punctuation. Pieces are packed greedily up to max_chars; a chunk shorter
+    than min_chars is merged into a neighbour when the result still fits."""
+    pieces = _pieces(text, max_chars)
+    if not pieces:
+        return []
+    # Greedy pack up to max_chars.
     chunks: List[str] = []
     buf = ""
-    for s in sentences:
-        s = s.strip()
-        if not s:
-            continue
+    for p in pieces:
         if not buf:
-            buf = s
-        elif len(buf) + 1 + len(s) <= max_chars:
-            buf += " " + s
+            buf = p
+        elif len(buf) + 1 + len(p) <= max_chars:
+            buf += " " + p
         else:
             chunks.append(buf)
-            buf = s
+            buf = p
     if buf:
         chunks.append(buf)
-    out: List[str] = []
+    # Soft minimum: fold an undersized chunk into a neighbour if it still fits.
+    merged: List[str] = []
     for c in chunks:
-        out.extend([c] if len(c) <= max_chars else _hard_split(c, max_chars))
-    return [c for c in out if c.strip()]
+        if (
+            merged
+            and (len(c) < min_chars or len(merged[-1]) < min_chars)
+            and len(merged[-1]) + 1 + len(c) <= max_chars
+        ):
+            merged[-1] = merged[-1] + " " + c
+        else:
+            merged.append(c)
+    return [c for c in merged if c.strip()]
 # -----------------------------------------------------------------------------
 
 # Voice library: saved voice profiles used via the "clone:ProfileName" voice prefix.
@@ -400,7 +410,10 @@ async def generate_speech(
         )
 
     # Decide chunking. A single chunk (or disabled) takes the original path.
-    chunks = _split_into_chunks(text, _MAX_CHUNK_CHARS) if _AUTOCHUNK else [text]
+    chunks = (
+        _split_into_chunks(text, _MIN_CHUNK_CHARS, _MAX_CHUNK_CHARS)
+        if _AUTOCHUNK else [text]
+    )
     if len(chunks) <= 1:
         try:
             return await _synth(text)
@@ -409,8 +422,8 @@ async def generate_speech(
 
     # Multi-chunk: synthesize each sentence-group, then merge with a short gap.
     logger.info(
-        "Auto-chunking %d chars into %d chunks (max=%d)",
-        len(text), len(chunks), _MAX_CHUNK_CHARS,
+        "Auto-chunking %d chars into %d chunks (window=%d-%d)",
+        len(text), len(chunks), _MIN_CHUNK_CHARS, _MAX_CHUNK_CHARS,
     )
     try:
         audios: List[np.ndarray] = []
