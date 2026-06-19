@@ -40,27 +40,20 @@ ENV PATH="/opt/venv/bin:$PATH"
 RUN pip install --no-cache-dir --upgrade pip setuptools wheel
 
 # =============================================================================
-# Stage 2: Python dependencies (prebuilt flash-attn wheel)
+# Stage 2: Heavy Python dependencies (stable layer — rebuilds only when deps change)
 # =============================================================================
-FROM base AS builder
+FROM base AS deps
 
 ARG TORCH_VERSION=2.5.1
 ARG FLASH_ATTN_WHEEL_URL=https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3%2Bcu12torch2.5cxx11abiFALSE-cp311-cp311-linux_x86_64.whl
 
-WORKDIR /build
-
-COPY pyproject.toml README.md MANIFEST.in LICENSE ./
-
-# Pin PyTorch to match the prebuilt flash-attn wheel (cu12 covers CUDA 12.x)
+# Single RUN keeps one venv layer instead of stacking torch + deps + flash-attn separately
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install \
     torch==${TORCH_VERSION} \
     torchaudio==${TORCH_VERSION} \
-    --index-url https://download.pytorch.org/whl/cu121
-
-# Pin runtime deps (skip gradio — not needed for the API server)
-RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install \
+    --index-url https://download.pytorch.org/whl/cu121 \
+    && pip install \
     transformers==4.57.3 \
     accelerate==1.12.0 \
     "PyYAML>=6.0" \
@@ -78,27 +71,40 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     "pydantic>=2.0.0" \
     inflect \
     aiofiles \
-    "httpx>=0.24.0"
+    "httpx>=0.24.0" \
+    && pip install "${FLASH_ATTN_WHEEL_URL}" \
+    && find /opt/venv -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
 
-# Prebuilt flash-attention 2 wheel (no source compile)
-RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install "${FLASH_ATTN_WHEEL_URL}"
+# =============================================================================
+# Stage 3: Application package (small layer — rebuilds on code changes)
+# =============================================================================
+FROM deps AS app
 
+WORKDIR /build
+
+COPY pyproject.toml README.md MANIFEST.in LICENSE ./
 COPY qwen_tts ./qwen_tts
 COPY api ./api
 
-# Install the app into site-packages (avoids editable install + pip in production)
 RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install --no-deps .
+    pip install --no-deps . \
+    && find /opt/venv -type d -name __pycache__ -exec rm -rf {} +
 
 # =============================================================================
-# Stage 3: Production image (official backend)
+# Stage 4: Production image (official backend)
 # =============================================================================
 FROM base AS production
 
 WORKDIR /app
 
-COPY --from=builder /opt/venv /opt/venv
+# Stable ~3 GB layer: deps only (not invalidated by app code changes)
+COPY --from=deps /opt/venv /opt/venv
+
+# Small layers: app code only (~few MB), rebuilds when source changes
+COPY --from=app /opt/venv/lib/python3.11/site-packages/qwen_tts /opt/venv/lib/python3.11/site-packages/qwen_tts
+COPY --from=app /opt/venv/lib/python3.11/site-packages/api /opt/venv/lib/python3.11/site-packages/api
+COPY --from=app /opt/venv/lib/python3.11/site-packages/qwen_tts-*.dist-info /opt/venv/lib/python3.11/site-packages/
+
 ENV PATH="/opt/venv/bin:$PATH"
 
 # Create non-root user for security
