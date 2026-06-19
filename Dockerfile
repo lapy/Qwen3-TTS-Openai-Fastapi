@@ -70,7 +70,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     numpy \
     scipy \
     einops \
-    onnxruntime-gpu \
+    onnxruntime-gpu==1.20.2 \
     sox \
     "fastapi>=0.109.0" \
     "uvicorn[standard]>=0.27.0" \
@@ -154,7 +154,7 @@ RUN pip install --no-cache-dir \
     numpy \
     scipy \
     einops \
-    onnxruntime-gpu
+    onnxruntime-gpu==1.20.2
 
 # Install FastAPI and server dependencies
 RUN pip install --no-cache-dir \
