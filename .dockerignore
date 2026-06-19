@@ -1,0 +1,46 @@
+.git
+.github
+.idea
+.vscode
+venv
+.venv
+env
+__pycache__
+*.py[cod]
+*.egg-info
+dist
+build
+
+# Tests, docs, and dev tooling (not needed in the image)
+tests/
+docs/
+examples/
+finetuning/
+pytest.ini
+*.md
+!README.md
+
+# Benchmarks and local artifacts
+bench_*.txt
+bench_*.py
+benchmark_*.py
+optimization_verification.txt
+verify_optimizations.py
+test_*.py
+server_*.log
+
+# Audio outputs
+output/
+*.wav
+*.mp3
+*.flac
+*.ogg
+*.m4a
+*.aac
+*.opus
+
+# Other Dockerfiles / compose (not used by production build)
+Dockerfile.*
+docker-compose*.yml
+.env
+.env.*

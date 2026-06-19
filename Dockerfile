@@ -18,14 +18,11 @@ ENV NVIDIA_VISIBLE_DEVICES=all
 ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility
 ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64:/usr/local/nvidia/lib:/usr/local/nvidia/lib64:${LD_LIBRARY_PATH}
 
-# Install system dependencies
+# Install system dependencies (no build toolchain — all Python deps are wheels)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3.11 \
     python3.11-venv \
-    python3.11-dev \
     python3-pip \
-    build-essential \
-    git \
     curl \
     ffmpeg \
     libsndfile1 \
@@ -43,66 +40,56 @@ ENV PATH="/opt/venv/bin:$PATH"
 RUN pip install --no-cache-dir --upgrade pip setuptools wheel
 
 # =============================================================================
-# Stage 2: Builder with CUDA development tools for flash-attn
+# Stage 2: Python dependencies (prebuilt flash-attn wheel)
 # =============================================================================
-FROM nvidia/cuda:12.1.1-cudnn8-devel-ubuntu22.04 AS builder
+FROM base AS builder
 
-# Install Python and build dependencies
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3.11 \
-    python3.11-venv \
-    python3.11-dev \
-    build-essential \
-    git \
-    curl \
-    ninja-build \
-    && rm -rf /var/lib/apt/lists/* \
-    && ln -sf /usr/bin/python3.11 /usr/bin/python3 \
-    && ln -sf /usr/bin/python3 /usr/bin/python
-
-# Set up Python virtual environment
-RUN python3 -m venv /opt/venv
-ENV PATH="/opt/venv/bin:$PATH"
-RUN pip install --no-cache-dir --upgrade pip setuptools wheel
+ARG TORCH_VERSION=2.5.1
+ARG FLASH_ATTN_WHEEL_URL=https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3%2Bcu12torch2.5cxx11abiFALSE-cp311-cp311-linux_x86_64.whl
 
 WORKDIR /build
 
-# Copy dependency files
-COPY pyproject.toml ./
-COPY README.md ./
+COPY pyproject.toml README.md MANIFEST.in LICENSE ./
 
-# Install Python dependencies
-RUN pip install --no-cache-dir \
-    torch>=2.0.0 \
-    torchaudio>=2.0.0 \
+# Pin PyTorch to match the prebuilt flash-attn wheel (cu12 covers CUDA 12.x)
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install \
+    torch==${TORCH_VERSION} \
+    torchaudio==${TORCH_VERSION} \
     --index-url https://download.pytorch.org/whl/cu121
 
-# Install the main package dependencies
-RUN pip install --no-cache-dir \
-    transformers>=4.40.0 \
-    accelerate>=1.0.0 \
+# Pin runtime deps (skip gradio — not needed for the API server)
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install \
+    transformers==4.57.3 \
+    accelerate==1.12.0 \
+    "PyYAML>=6.0" \
     librosa \
     soundfile \
     pydub \
     numpy \
     scipy \
     einops \
-    onnxruntime-gpu
-
-# Install FastAPI and server dependencies
-RUN pip install --no-cache-dir \
-    fastapi>=0.109.0 \
-    uvicorn[standard]>=0.27.0 \
+    onnxruntime-gpu \
+    sox \
+    "fastapi>=0.109.0" \
+    "uvicorn[standard]>=0.27.0" \
     python-multipart \
-    pydantic>=2.0.0 \
+    "pydantic>=2.0.0" \
     inflect \
-    aiofiles
+    aiofiles \
+    "httpx>=0.24.0"
 
-# Install ninja for faster flash-attn compilation
-RUN pip install --no-cache-dir ninja packaging wheel
+# Prebuilt flash-attention 2 wheel (no source compile)
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install "${FLASH_ATTN_WHEEL_URL}"
 
-# Install flash-attention 2 for optimized attention (requires CUDA)
-RUN pip install --no-cache-dir flash-attn --no-build-isolation
+COPY qwen_tts ./qwen_tts
+COPY api ./api
+
+# Install the app into site-packages (avoids editable install + pip in production)
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install --no-deps .
 
 # =============================================================================
 # Stage 3: Production image (official backend)
@@ -111,15 +98,8 @@ FROM base AS production
 
 WORKDIR /app
 
-# Copy virtual environment from builder
 COPY --from=builder /opt/venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
-
-# Copy application code
-COPY . .
-
-# Install the package in editable mode
-RUN pip install --no-cache-dir -e .
 
 # Create non-root user for security
 RUN useradd --create-home --shell /bin/bash appuser \
